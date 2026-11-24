@@ -3964,6 +3964,7 @@ def init_clan_schema():
             telegram_id INTEGER PRIMARY KEY,
             clan_name TEXT NOT NULL,
             questionnaire TEXT,
+            deputy_id INTEGER,
             prompt_message_id INTEGER,
             created_at TEXT NOT NULL
         );
@@ -3989,6 +3990,11 @@ def init_clan_schema():
         }
         if "verification_deadline" not in clan_columns:
             conn.execute("ALTER TABLE clans ADD COLUMN verification_deadline TEXT")
+        creation_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(clan_creation_sessions)").fetchall()
+        }
+        if "deputy_id" not in creation_columns:
+            conn.execute("ALTER TABLE clan_creation_sessions ADD COLUMN deputy_id INTEGER")
         conn.commit()
 
 
@@ -4238,8 +4244,8 @@ async def clan_creation_reply(message: Message) -> bool:
     )
     with db_connect() as conn:
         conn.execute(
-            "UPDATE clan_creation_sessions SET questionnaire=? WHERE telegram_id=?",
-            (questionnaire, message.from_user.id)
+            "UPDATE clan_creation_sessions SET questionnaire=?, deputy_id=? WHERE telegram_id=?",
+            (questionnaire, deputy["telegram_id"], message.from_user.id)
         )
         conn.commit()
 
@@ -4289,14 +4295,8 @@ async def clan_rules_callback(callback: CallbackQuery):
 
         creator = conn.execute("SELECT * FROM users WHERE telegram_id=?", (owner_id,)).fetchone()
         deputy_row = conn.execute(
-            """SELECT u.* FROM users u
-               WHERE lower(ltrim(u.telegram_username, '@')) = lower(?)
-                  OR lower(u.minecraft_nickname) = lower(?)
-               LIMIT 1""",
-            (
-                session["questionnaire"].split(" / @")[-1],
-                session["questionnaire"].split("Заместитель: ", 1)[-1].split(" / ", 1)[0]
-            )
+            "SELECT * FROM users WHERE telegram_id=?",
+            (session["deputy_id"],)
         ).fetchone()
 
         if not creator or not deputy_row or deputy_row["telegram_id"] == owner_id:
