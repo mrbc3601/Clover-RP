@@ -654,12 +654,14 @@ def is_expired_warn_ban(telegram_id: int) -> bool:
     with db_connect() as conn:
         row = conn.execute(
             """
-            SELECT 1 FROM bans
-            WHERE telegram_id = ?
-              AND ban_type = 'warn'
-              AND expires_at IS NOT NULL
-              AND expires_at <= ?
-            ORDER BY created_at DESC
+            SELECT 1 FROM bans b
+            JOIN users u ON u.telegram_id = b.telegram_id
+            WHERE b.telegram_id = ?
+              AND b.ban_type = 'warn'
+              AND b.expires_at IS NOT NULL
+              AND b.expires_at <= ?
+              AND u.rank IN ('legacy', 'warnbanned')
+            ORDER BY b.created_at DESC
             LIMIT 1
             """,
             (telegram_id, now)
@@ -1002,7 +1004,10 @@ class LegacyAccessMiddleware(BaseMiddleware):
         text = event.text or event.caption or ""
         if text.startswith("/"):
             row = get_user(user.id)
-            if row and row["rank"] == "legacy":
+            if row and (
+                row["rank"] == "legacy"
+                or (row["rank"] == "warnbanned" and is_expired_warn_ban(user.id))
+            ):
                 command_token = text.split(maxsplit=1)[0]
                 command_name = command_token.split("@", 1)[0].lstrip("/").lower()
 
