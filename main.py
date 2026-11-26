@@ -3927,6 +3927,224 @@ async def cmd_unwarn(message: Message):
     )
 
 
+
+
+# =====================================================
+# /BAN AND /UNBAN — MANUAL PLAYER BAN MANAGEMENT
+# =====================================================
+
+async def cmd_ban(message: Message):
+    if not message.from_user:
+        return
+    if not is_senior_admin(message.from_user.id):
+        await message.reply("Команда доступна только st_admin и owner.")
+        return
+
+    parts = extract_command(message).split(maxsplit=1)
+    if len(parts) != 2:
+        await message.reply(
+            "Использование: <code>/ban &lt;TG ID / @username / MinecraftNick&gt; причина</code>"
+        )
+        return
+
+    target = get_warn_target(parts[0])
+    reason = parts[1].strip()
+    if not target:
+        await message.reply("Игрок не найден в базе users.")
+        return
+    if not reason or len(reason) > 350 or any(c in reason for c in "\\r\\n\\x00"):
+        await message.reply("Причина должна быть одной строкой длиной до 350 символов.")
+        return
+    if target["telegram_id"] == message.from_user.id:
+        await message.reply("Нельзя заблокировать самого себя.")
+        return
+    if is_banned(target["telegram_id"]):
+        await message.reply("Этот пользователь уже заблокирован.")
+        return
+
+    actor = get_account(message.from_user.id)
+    if actor and actor["rank"] == "st_admin" and target["rank"] in {"owner", "st_admin"}:
+        await message.reply("st_admin не может блокировать owner или другого st_admin.")
+        return
+    if target["rank"] == "owner" and (not actor or actor["rank"] != "owner"):
+        await message.reply("Только owner может заблокировать owner.")
+        return
+
+    target_account = get_account(target["telegram_id"])
+    previous_rank = (
+        target_account.get("original_rank")
+        if target_account and target_account.get("rank") == "rest"
+        else target["rank"]
+    )
+    created_at = moscow_iso(moscow_now())
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO bans
+                (telegram_id, reason, created_at, expires_at, minecraft_nickname,
+                 ban_type, previous_rank, admin_id, unbanned_at)
+            VALUES (?, ?, ?, NULL, ?, 'manual', ?, ?, NULL)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                reason=excluded.reason,
+                created_at=excluded.created_at,
+                expires_at=NULL,
+                minecraft_nickname=excluded.minecraft_nickname,
+                ban_type='manual',
+                previous_rank=excluded.previous_rank,
+                admin_id=excluded.admin_id,
+                unbanned_at=NULL
+            """,
+            (
+                target["telegram_id"], reason, created_at,
+                target["minecraft"] or None, previous_rank, message.from_user.id
+            )
+        )
+        conn.execute(
+            """
+            INSERT INTO ban_history
+                (telegram_id, admin_id, reason, ban_type, created_at, expires_at, status)
+            VALUES (?, ?, ?, 'manual', ?, NULL, 'active')
+            """,
+            (target["telegram_id"], message.from_user.id, reason, created_at)
+        )
+        conn.execute(
+            "UPDATE users SET rank='banned' WHERE telegram_id=?",
+            (target["telegram_id"],)
+        )
+        conn.commit()
+
+    results = []
+    try:
+        if MAIN_CHAT_ID:
+            await message.bot.ban_chat_member(MAIN_CHAT_ID, target["telegram_id"])
+        results.append("Telegram: заблокирован")
+    except Exception:
+        log.exception("Telegram manual ban failed for %s", target["telegram_id"])
+        results.append("Telegram: ошибка блокировки")
+
+    if target["minecraft"]:
+        for command in (
+            f"ban {target['minecraft']} {reason}",
+            f"swl remove {target['minecraft']}",
+            "swl reload"
+        ):
+            try:
+                await rcon_command(command)
+                results.append(f"{command}: OK")
+            except Exception:
+                log.exception("Manual ban RCON command failed: %s", command)
+                results.append(f"{command}: ошибка")
+
+    try:
+        await message.bot.send_message(
+            target["telegram_id"],
+            "Вы заблокированы в CloverTeam администрацией.\n"
+            f"Причина: {safe_html(reason)}"
+        )
+    except Exception:
+        log.warning("Could not notify manually banned user %s", target["telegram_id"], exc_info=True)
+
+    await message.reply(
+        f"Пользователь <code>{safe_html(target['minecraft'] or target['username'] or target['telegram_id'])}</code> заблокирован.\n"
+        + safe_html("; ".join(results))
+    )
+
+
+async def cmd_unban(message: Message):
+    if not message.from_user:
+        return
+    if not is_senior_admin(message.from_user.id):
+        await message.reply("Команда доступна только st_admin и owner.")
+        return
+
+    value = extract_command(message).strip()
+    if not value:
+        await message.reply("Использование: <code>/unban &lt;TG ID / @username / MinecraftNick&gt;</code>")
+        return
+    target = get_warn_target(value)
+    if not target:
+        await message.reply("Игрок не найден в базе users.")
+        return
+
+    now = moscow_iso(moscow_now())
+    with db_connect() as conn:
+        ban = conn.execute(
+            """
+            SELECT * FROM bans
+            WHERE telegram_id = ? AND unbanned_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
+            """,
+            (target["telegram_id"], now)
+        ).fetchone()
+        if not ban:
+            await message.reply("У этого пользователя нет активной блокировки.")
+            return
+
+        restored_rank = ban["previous_rank"] or "player"
+        if restored_rank in {"banned", "warnbanned"}:
+            restored_rank = "legacy"
+        conn.execute(
+            "UPDATE bans SET unbanned_at=? WHERE telegram_id=? AND unbanned_at IS NULL",
+            (now, target["telegram_id"])
+        )
+        conn.execute(
+            "UPDATE users SET rank=? WHERE telegram_id=?",
+            (restored_rank, target["telegram_id"])
+        )
+        conn.execute(
+            """
+            UPDATE ban_history SET status='unbanned'
+            WHERE id = (
+                SELECT id FROM ban_history
+                WHERE telegram_id=? AND status='active'
+                ORDER BY id DESC LIMIT 1
+            )
+            """,
+            (target["telegram_id"],)
+        )
+        conn.commit()
+
+    results = []
+    try:
+        if MAIN_CHAT_ID:
+            await message.bot.unban_chat_member(
+                MAIN_CHAT_ID,
+                target["telegram_id"],
+                only_if_banned=True
+            )
+        results.append("Telegram: блокировка снята")
+    except Exception:
+        log.exception("Telegram unban failed for %s", target["telegram_id"])
+        results.append("Telegram: ошибка снятия блокировки")
+
+    if target["minecraft"]:
+        for command in (
+            f"pardon {target['minecraft']}",
+            f"swl add {target['minecraft']}",
+            "swl reload"
+        ):
+            try:
+                await rcon_command(command)
+                results.append(f"{command}: OK")
+            except Exception:
+                log.exception("Unban RCON command failed: %s", command)
+                results.append(f"{command}: ошибка")
+
+    try:
+        await message.bot.send_message(
+            target["telegram_id"],
+            "Администрация сняла вашу блокировку в CloverTeam.\n"
+            "Если ваш ранг — legacy, для восстановления доступа потребуется повторная регистрация."
+        )
+    except Exception:
+        log.warning("Could not notify unbanned user %s", target["telegram_id"], exc_info=True)
+
+    await message.reply(
+        f"Блокировка пользователя <code>{safe_html(target['minecraft'] or target['username'] or target['telegram_id'])}</code> снята.\n"
+        + safe_html("; ".join(results))
+    )
+
+
 # =====================================================
 # /ONLINE
 # =====================================================
@@ -6177,6 +6395,9 @@ async def main():
         cmd_unwarn,
         Command("unwarn")
     )
+
+    dp.message.register(cmd_ban, Command("ban"))
+    dp.message.register(cmd_unban, Command("unban"))
 
     # ---------------------------------------------
     # Private replies
