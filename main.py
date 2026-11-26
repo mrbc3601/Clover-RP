@@ -380,6 +380,13 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_conversation_messages (
+                message_id INTEGER PRIMARY KEY,
+                report_id INTEGER NOT NULL,
+                side TEXT NOT NULL CHECK(side IN ('user', 'admin'))
+            )
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
@@ -4689,7 +4696,7 @@ async def report_private_input(message: Message) -> bool:
         return False
     session = get_report_session(message.from_user.id)
     if not session:
-        return False
+        return await report_conversation_reply(message, "user")
 
     step = session["step"]
     data = session["data"]
@@ -4852,6 +4859,43 @@ async def report_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
+    if data.startswith("report_reply:"):
+        if not callback.message or callback.message.chat.id != ADMIN_CHAT_ID:
+            await callback.answer("Ответить можно только из админ-чата.", show_alert=True)
+            return
+        admin = get_user(callback.from_user.id)
+        if not admin or admin["rank"] not in REPORT_ADMIN_RANKS or get_rest_period(callback.from_user.id):
+            await callback.answer("Недостаточно прав для ответа.", show_alert=True)
+            return
+        try:
+            report_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await callback.answer("Некорректный номер жалобы.", show_alert=True)
+            return
+        with db_connect() as conn:
+            report = conn.execute(
+                "SELECT * FROM reports WHERE id=? AND status='pending'",
+                (report_id,)
+            ).fetchone()
+        if not report:
+            await callback.answer("Жалоба уже закрыта или не найдена.", show_alert=True)
+            return
+        thread_kwargs = {"message_thread_id": REPORT_THREAD_ID} if REPORT_THREAD_ID else {}
+        prompt = await callback.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"Напишите ответ игроку по жалобе №{report_id}. "
+            "Отправьте текст или медиа в ответ на это сообщение.",
+            **thread_kwargs
+        )
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO report_reply_prompts(prompt_message_id, report_id, admin_id, created_at) VALUES (?, ?, ?, ?)",
+                (prompt.message_id, report_id, callback.from_user.id, moscow_iso(moscow_now()))
+            )
+            conn.commit()
+        await callback.answer("Жду ответ администрации.")
+        return
+
     if data.startswith("report_resolve:") or data.startswith("report_reject:"):
         if not callback.message or callback.message.chat.id != ADMIN_CHAT_ID:
             await callback.answer("Обрабатывать жалобы можно только в админ-чате.", show_alert=True)
@@ -4921,6 +4965,121 @@ async def report_callback(callback: CallbackQuery):
                 conn.commit()
             await callback.answer("Ожидаю причину отклонения.")
         return
+
+
+
+async def report_conversation_reply(message: Message, side: str) -> bool:
+    """Двусторонняя переписка игрока и администрации внутри конкретной жалобы."""
+    if not message.from_user or not message.reply_to_message:
+        return False
+    with db_connect() as conn:
+        mapping = conn.execute(
+            "SELECT report_id FROM report_conversation_messages WHERE message_id=?",
+            (message.reply_to_message.message_id,)
+        ).fetchone()
+        if not mapping:
+            return False
+        report = conn.execute(
+            "SELECT * FROM reports WHERE id=? AND status='pending'",
+            (mapping["report_id"],)
+        ).fetchone()
+    if not report:
+        await message.reply("Эта переписка по жалобе уже закрыта.")
+        return True
+
+    if side == "user":
+        if int(report["telegram_id"]) != message.from_user.id or mapping["report_id"] is None:
+            return False
+        header = f"Сообщение от игрока по жалобе №{report['id']}"
+        destination = ADMIN_CHAT_ID
+        thread_kwargs = {"message_thread_id": REPORT_THREAD_ID} if REPORT_THREAD_ID else {}
+    else:
+        admin = get_user(message.from_user.id)
+        if (
+            not admin
+            or admin["rank"] not in REPORT_ADMIN_RANKS
+            or get_rest_period(message.from_user.id)
+        ):
+            return False
+        header = f"Ответ администрации по жалобе №{report['id']}"
+        destination = int(report["telegram_id"])
+        thread_kwargs = {}
+
+    try:
+        await message.bot.send_message(destination, f"<b>{safe_html(header)}</b>", **thread_kwargs)
+        copied = await message.bot.copy_message(
+            chat_id=destination,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+            **thread_kwargs
+        )
+    except Exception:
+        log.exception("Could not forward conversation message for report %s", report["id"])
+        await message.reply("Не удалось переслать сообщение. Попробуйте ещё раз.")
+        return True
+
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO report_conversation_messages(message_id, report_id, side) VALUES (?, ?, ?)",
+            (copied.message_id, report["id"], "admin" if side == "user" else "user")
+        )
+        conn.commit()
+    await message.reply("Сообщение отправлено администрации." if side == "user" else "Ответ отправлен игроку.")
+    return True
+
+
+async def report_admin_reply(message: Message) -> bool:
+    if not message.from_user or not message.reply_to_message:
+        return False
+    admin = get_user(message.from_user.id)
+    if not admin or admin["rank"] not in REPORT_ADMIN_RANKS or get_rest_period(message.from_user.id):
+        return False
+
+    with db_connect() as conn:
+        prompt = conn.execute(
+            "SELECT * FROM report_reply_prompts WHERE prompt_message_id=? AND admin_id=?",
+            (message.reply_to_message.message_id, message.from_user.id)
+        ).fetchone()
+        if prompt:
+            report = conn.execute(
+                "SELECT * FROM reports WHERE id=? AND status='pending'",
+                (prompt["report_id"],)
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM report_reply_prompts WHERE prompt_message_id=?",
+                (message.reply_to_message.message_id,)
+            )
+            conn.commit()
+        else:
+            report = None
+    if prompt:
+        if not report:
+            await message.reply("Жалоба уже закрыта или не найдена.")
+            return True
+        try:
+            header = await message.bot.send_message(
+                report["telegram_id"],
+                f"<b>Ответ администрации по жалобе №{report['id']}</b>"
+            )
+            copied = await message.bot.copy_message(
+                chat_id=report["telegram_id"],
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+        except Exception:
+            log.exception("Could not send ticket reply for report %s", report["id"])
+            await message.reply("Не удалось отправить ответ игроку.")
+            return True
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO report_conversation_messages(message_id, report_id, side) VALUES (?, ?, 'user')",
+                (copied.message_id, report["id"])
+            )
+            conn.commit()
+        await message.reply(f"Ответ по жалобе №{report['id']} отправлен игроку. Жалоба остаётся открытой.")
+        return True
+
+    return await report_conversation_reply(message, "admin")
 
 
 async def report_rejection_reply(message: Message) -> bool:
@@ -5146,6 +5305,10 @@ async def admin_reply_router(message: Message):
         return
 
     handled = await report_rejection_reply(message)
+    if handled:
+        return
+
+    handled = await report_admin_reply(message)
     if handled:
         return
 
