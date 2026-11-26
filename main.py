@@ -4633,6 +4633,12 @@ async def report_private_input(message: Message) -> bool:
             await message.reply("Пришлите фото или видео в ответ на сообщение бота.")
             return True
         data.setdefault("evidence", []).append(item)
+        save_report_session(
+            message.from_user.id,
+            "await_media",
+            session["prompt_message_id"],
+            data
+        )
         await message.reply(
             "Доказательство добавлено. Можете отправить ещё фото/видео или нажать «Готово».",
             reply_markup=report_choice_keyboard("media_done")
