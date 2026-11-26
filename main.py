@@ -3983,19 +3983,20 @@ async def cmd_ban(message: Message):
         return
 
     actor = get_account(message.from_user.id)
-    if actor and actor["rank"] == "st_admin" and target["rank"] in {"owner", "st_admin"}:
-        await message.reply("st_admin не может блокировать owner или другого st_admin.")
-        return
-    if target["rank"] == "owner" and (not actor or actor["rank"] != "owner"):
-        await message.reply("Только owner может заблокировать owner.")
-        return
-
     target_account = get_account(target["telegram_id"])
-    previous_rank = (
+    target_effective_rank = (
         target_account.get("original_rank")
         if target_account and target_account.get("rank") == "rest"
         else target["rank"]
     )
+    if actor and actor["rank"] == "st_admin" and target_effective_rank in {"owner", "st_admin"}:
+        await message.reply("st_admin не может блокировать owner или другого st_admin.")
+        return
+    if target_effective_rank == "owner" and (not actor or actor["rank"] != "owner"):
+        await message.reply("Только owner может заблокировать owner.")
+        return
+
+    previous_rank = target_effective_rank
     created_at = moscow_iso(moscow_now())
     with db_connect() as conn:
         conn.execute(
