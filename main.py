@@ -56,6 +56,7 @@ DB_PATH = BASE_DIR / os.getenv(
 
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 ADMIN_THREAD_ID = int(os.getenv("ADMIN_THREAD_ID", "0"))
+REPORT_THREAD_ID = int(os.getenv("REPORT_THREAD_ID", "0"))
 MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "0"))
 
 APPLICATION_THREAD_ID = int(
@@ -89,25 +90,29 @@ log = logging.getLogger("cloverteam")
 
 RANKS = [
     "legacy",
-    "player",
     "rest",
+    "player",
     "helper",
-    "moder",
+    "montash",
     "eventor",
-    "tech_admin",
+    "moder",
+    "m_admin",
     "admin",
+    "tech_admin",
     "st_admin",
     "owner",
 ]
 
 STAFF_RANKS = set(RANKS[3:])
-JAVA_RANKS = {"owner", "st_admin"}
+JAVA_RANKS = {"tech_admin", "admin", "st_admin", "owner"}
 
 REST_ELIGIBLE_RANKS = {
     "player",
     "helper",
-    "moder",
+    "montash",
     "eventor",
+    "moder",
+    "m_admin",
     "tech_admin",
     "admin",
     "st_admin",
@@ -303,6 +308,18 @@ def init_db():
             """)
             conn.execute("DROP TABLE users")
             conn.execute("ALTER TABLE users_new RENAME TO users")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS whitelist_pending (
+                telegram_id INTEGER PRIMARY KEY,
+                minecraft_nickname TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                applied_at TEXT,
+                last_error TEXT
+            )
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
@@ -561,12 +578,15 @@ def is_banned(telegram_id: int) -> bool:
 
 WARN_RANK_LEVEL = {
     "player": 0,
+    "montash": 1,
     "helper": 1,
+    "eventor": 2,
     "moder": 2,
-    "admin": 3,
-    "tech_admin": 3,
-    "st_admin": 4,
-    "owner": 5,
+    "m_admin": 3,
+    "admin": 4,
+    "tech_admin": 4,
+    "st_admin": 5,
+    "owner": 6,
 }
 
 
@@ -840,6 +860,93 @@ async def track_legacy_chat_member(event: ChatMemberUpdated):
 
     if is_member:
         ensure_legacy_user(user.id, user.username or "")
+        user_row = get_user(user.id)
+        if user_row and user_row["rank"] not in {"legacy", "banned", "warnbanned"}:
+            nickname = user_row["minecraft_nickname"]
+            if nickname:
+                schedule_whitelist_after_join(user.id, nickname)
+
+
+def schedule_whitelist_after_join(telegram_id: int, nickname: str):
+    """Запускает единственный 24-часовой таймер после первого входа в основной чат."""
+    now = moscow_now()
+    joined_at = moscow_iso(now)
+    due_at = moscow_iso(now + timedelta(hours=24))
+    with db_connect() as conn:
+        existing = conn.execute(
+            "SELECT status FROM whitelist_pending WHERE telegram_id = ?",
+            (telegram_id,)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """
+            INSERT INTO whitelist_pending
+                (telegram_id, minecraft_nickname, joined_at, due_at, status)
+            VALUES (?, ?, ?, ?, 'pending')
+            """,
+            (telegram_id, nickname, joined_at, due_at)
+        )
+        conn.commit()
+    log.info("Whitelist timer scheduled: telegram_id=%s nickname=%s due_at=%s", telegram_id, nickname, due_at)
+    return True
+
+
+async def whitelist_worker():
+    """Выдаёт whitelist через 24 часа; очередь хранится в SQLite и переживает перезапуск."""
+    while True:
+        try:
+            now = moscow_iso(moscow_now())
+            with db_connect() as conn:
+                due_rows = conn.execute(
+                    """
+                    SELECT telegram_id, minecraft_nickname
+                    FROM whitelist_pending
+                    WHERE status = 'pending' AND due_at <= ?
+                    ORDER BY due_at
+                    LIMIT 50
+                    """,
+                    (now,)
+                ).fetchall()
+
+            for item in due_rows:
+                telegram_id = int(item["telegram_id"])
+                nickname = item["minecraft_nickname"]
+                try:
+                    await rcon_command(f"swl add {nickname}")
+                    await rcon_command("swl reload")
+                    with db_connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE whitelist_pending
+                            SET status = 'applied', applied_at = ?, last_error = NULL
+                            WHERE telegram_id = ? AND status = 'pending'
+                            """,
+                            (moscow_iso(moscow_now()), telegram_id)
+                        )
+                        conn.commit()
+                    log.info("Whitelist applied: telegram_id=%s nickname=%s", telegram_id, nickname)
+                except Exception as error:
+                    log.exception("Whitelist grant failed: telegram_id=%s nickname=%s", telegram_id, nickname)
+                    with db_connect() as conn:
+                        conn.execute(
+                            """
+                            UPDATE whitelist_pending
+                            SET due_at = ?, last_error = ?
+                            WHERE telegram_id = ? AND status = 'pending'
+                            """,
+                            (
+                                moscow_iso(moscow_now() + timedelta(minutes=5)),
+                                str(error)[:500],
+                                telegram_id
+                            )
+                        )
+                        conn.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Whitelist worker failed")
+        await asyncio.sleep(30)
 
 
 # =====================================================
@@ -1531,6 +1638,21 @@ async def cmd_reg(message: Message):
         )
         return
 
+    # Если игрок уже состоит в основном чате, таймер начинается сразу после регистрации.
+    already_in_main_chat = message.chat.id == MAIN_CHAT_ID
+    if not already_in_main_chat and MAIN_CHAT_ID:
+        try:
+            member = await message.bot.get_chat_member(MAIN_CHAT_ID, telegram_id)
+            already_in_main_chat = (
+                member.status in {"creator", "administrator", "member"}
+                or (member.status == "restricted" and getattr(member, "is_member", False))
+            )
+        except Exception:
+            log.warning("Could not recheck main-chat membership after /reg: %s", telegram_id, exc_info=True)
+
+    if already_in_main_chat:
+        schedule_whitelist_after_join(telegram_id, nickname)
+
     # Приглашение создаём только после подтверждённого сохранения.
     invite_text = ""
 
@@ -1711,6 +1833,12 @@ async def cmd_unreg(message: Message):
             (telegram_id,)
         )
 
+        # Удаляем отложенную выдачу whitelist, чтобы таймер не выдал его после /unreg.
+        conn.execute(
+            "DELETE FROM whitelist_pending WHERE telegram_id = ?",
+            (telegram_id,)
+        )
+
         conn.execute(
             "DELETE FROM rest_periods WHERE telegram_id = ?",
             (telegram_id,)
@@ -1737,12 +1865,23 @@ async def cmd_unreg(message: Message):
 
         conn.commit()
 
+    whitelist_result = "Minecraft whitelist не менялся (ник не указан)."
+    if nickname:
+        try:
+            await rcon_command(f"swl remove {nickname}")
+            await rcon_command("swl reload")
+            whitelist_result = "Игрок удалён из Minecraft whitelist."
+        except Exception:
+            log.exception("Could not remove whitelist during /unreg: %s", nickname)
+            whitelist_result = "Не удалось удалить игрока из whitelist через RCON; проверьте сервер вручную."
+
     await message.reply(
         "✅ Регистрация пользователя удалена из базы данных.\n\n"
         f"Telegram ID: <code>{telegram_id}</code>\n"
         f"Username: <code>{safe_html(telegram_username)}</code>\n"
         f"Minecraft: <code>{safe_html(nickname)}</code>\n"
-        f"Прежний ранг: <code>{safe_html(old_rank)}</code>"
+        f"Прежний ранг: <code>{safe_html(old_rank)}</code>\n"
+        f"{safe_html(whitelist_result)}"
     )
 
     try:
@@ -5325,6 +5464,10 @@ async def main():
         warn_expiration_worker()
     )
 
+    whitelist_task = asyncio.create_task(
+        whitelist_worker()
+    )
+
     log.info("CloverTeam bot started")
 
     try:
@@ -5337,8 +5480,9 @@ async def main():
         expiration_task.cancel()
         clan_expiration_task.cancel()
         warn_expiration_task.cancel()
+        whitelist_task.cancel()
 
-        for task in (expiration_task, clan_expiration_task, warn_expiration_task):
+        for task in (expiration_task, clan_expiration_task, warn_expiration_task, whitelist_task):
             try:
                 await task
             except asyncio.CancelledError:
