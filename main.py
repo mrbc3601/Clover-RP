@@ -4834,6 +4834,39 @@ async def report_rejection_reply(message: Message) -> bool:
     return True
 
 
+async def sync_known_chat_members(bot: Bot, chat_id: int):
+    """Обновляет членство известных по БД пользователей перед массовым упоминанием."""
+    staff_sql = ""
+    if chat_id == ADMIN_CHAT_ID:
+        staff_sql = "AND rank IN ('helper','montash','moder','eventor','m_admin','admin','tech_admin','st_admin','owner')"
+    with db_connect() as conn:
+        known = conn.execute(
+            "SELECT telegram_id, telegram_username FROM users WHERE 1=1 " + staff_sql
+        ).fetchall()
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def check(row):
+        async with semaphore:
+            user_id = int(row["telegram_id"])
+            try:
+                member = await bot.get_chat_member(chat_id, user_id)
+                active = member.status in {"creator", "administrator", "member"}
+                if member.status == "restricted":
+                    active = bool(getattr(member, "is_member", False))
+                is_bot = bool(getattr(member.user, "is_bot", False))
+                record_chat_member(
+                    chat_id, user_id, row["telegram_username"] or "", is_bot, active
+                )
+            except Exception:
+                # Неизвестный/недоступный аккаунт не должен попадать в массовый пинг.
+                record_chat_member(
+                    chat_id, user_id, row["telegram_username"] or "", False, False
+                )
+
+    await asyncio.gather(*(check(row) for row in known))
+
+
 async def cmd_call(message: Message):
     if not message.from_user or message.chat.id not in {MAIN_CHAT_ID, ADMIN_CHAT_ID}:
         return
@@ -4843,6 +4876,7 @@ async def cmd_call(message: Message):
         return
 
     chat_id = message.chat.id
+    await sync_known_chat_members(message.bot, chat_id)
     now = moscow_now()
     with db_connect() as conn:
         cooldown = conn.execute(
