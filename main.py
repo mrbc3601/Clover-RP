@@ -4662,7 +4662,8 @@ async def report_callback(callback: CallbackQuery):
                 save_report_session(callback.from_user.id, "category", prompt.message_id, session_data)
             elif choice == "chat":
                 prompt = await callback.message.edit_text(
-                    "На кого и почему вы жалуетесь? Ответьте текстом на это сообщение."
+                    "<i>На кого и почему вы жалуетесь?</i>\\n"
+                    "Ответьте одним сообщением в ответ на это сообщение."
                 )
                 session_data["location"] = "chat"
                 session_data["report_type"] = "Жалоба на игрока (чат)"
@@ -4680,9 +4681,14 @@ async def report_callback(callback: CallbackQuery):
                 "Техническая проблема" if choice == "technical"
                 else "Жалоба на игрока (сервер)"
             )
-            prompt = await callback.message.edit_text(
-                "Опишите проблему одним сообщением в ответ на это сообщение."
+            prompt_text = (
+                "<i>С какой проблемой вы столкнулись?</i>\\n"
+                "Ответьте одним сообщением в ответ на это сообщение."
+                if choice == "technical"
+                else "<i>На кого и почему вы жалуетесь?</i>\\n"
+                "Ответьте одним сообщением в ответ на это сообщение."
             )
+            prompt = await callback.message.edit_text(prompt_text)
             save_report_session(callback.from_user.id, "await_text", prompt.message_id, session_data)
 
         elif data.startswith("report_evidence:"):
