@@ -1146,21 +1146,17 @@ def schedule_whitelist_after_join(telegram_id: int, nickname: str):
     joined_at = moscow_iso(now)
     due_at = moscow_iso(now + timedelta(hours=24))
     with db_connect() as conn:
-        existing = conn.execute(
-            "SELECT status FROM whitelist_pending WHERE telegram_id = ?",
-            (telegram_id,)
-        ).fetchone()
-        if existing:
-            return False
-        conn.execute(
+        cursor = conn.execute(
             """
-            INSERT INTO whitelist_pending
+            INSERT OR IGNORE INTO whitelist_pending
                 (telegram_id, minecraft_nickname, joined_at, due_at, status)
             VALUES (?, ?, ?, ?, 'pending')
             """,
             (telegram_id, nickname, joined_at, due_at)
         )
         conn.commit()
+        if cursor.rowcount != 1:
+            return False
     log.info("Whitelist timer scheduled: telegram_id=%s nickname=%s due_at=%s", telegram_id, nickname, due_at)
     return True
 
