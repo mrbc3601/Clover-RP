@@ -4753,7 +4753,7 @@ async def report_callback(callback: CallbackQuery):
         return
     data = callback.data or ""
 
-    if data.startswith("report_location:") or data.startswith("report_category:") or data.startswith("report_evidence:") or data == "report_media_done":
+    if data.startswith("report_location:") or data.startswith("report_category:") or data.startswith("report_format:") or data.startswith("report_evidence:") or data == "report_media_done":
         if not callback.message or callback.message.chat.type != "private":
             await callback.answer("Этот шаг можно выполнить только в личном чате с ботом.", show_alert=True)
             return
