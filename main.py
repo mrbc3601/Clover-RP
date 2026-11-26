@@ -365,6 +365,21 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
+        report_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()
+        }
+        if "format" not in report_columns:
+            conn.execute(
+                "ALTER TABLE reports ADD COLUMN format TEXT NOT NULL DEFAULT 'ordinary'"
+            )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_reply_prompts (
+                prompt_message_id INTEGER PRIMARY KEY,
+                report_id INTEGER NOT NULL,
+                admin_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
@@ -4530,6 +4545,11 @@ def report_choice_keyboard(kind: str):
         ], [
             InlineKeyboardButton(text="Жалоба на игрока", callback_data="report_category:player")
         ]]
+    elif kind == "format":
+        rows = [[
+            InlineKeyboardButton(text="Тикеты", callback_data="report_format:ticket"),
+            InlineKeyboardButton(text="Обычная жалоба", callback_data="report_format:ordinary")
+        ]]
     elif kind == "evidence":
         rows = [[
             InlineKeyboardButton(text="Да", callback_data="report_evidence:yes"),
@@ -4542,11 +4562,17 @@ def report_choice_keyboard(kind: str):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def report_admin_keyboard(report_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Проблема решена", callback_data=f"report_resolve:{report_id}"),
-        InlineKeyboardButton(text="❌ Отклонить жалобу", callback_data=f"report_reject:{report_id}")
-    ]])
+def report_admin_keyboard(report_id: int, is_ticket: bool = False):
+    reply_label = "Ответить на тикет" if is_ticket else "Ответить игроку"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Проблема решена", callback_data=f"report_resolve:{report_id}"),
+            InlineKeyboardButton(text="❌ Отклонить жалобу", callback_data=f"report_reject:{report_id}")
+        ],
+        [
+            InlineKeyboardButton(text=reply_label, callback_data=f"report_reply:{report_id}")
+        ]
+    ])
 
 
 async def cmd_report(message: Message):
@@ -4578,8 +4604,11 @@ async def submit_report(message: Message, session_data: dict):
     report_text = session_data["report_text"]
     username = "@" + user.username if user.username else "не указан"
 
+    report_format = session_data.get("format", "ordinary")
+    format_line = "<b>Формат: Тикет</b>\n" if report_format == "ticket" else ""
     admin_text = (
         "<b>Новый репорт CloverTeam</b>\n\n"
+        f"{format_line}"
         f"Репорт от игрока: {safe_html(username)}\n"
         f"Никнейм: <code>{safe_html(nickname or 'не указан')}</code>\n"
         f"Тип: <b>{safe_html(report_type)}</b>\n"
@@ -4593,7 +4622,7 @@ async def submit_report(message: Message, session_data: dict):
         sent = await message.bot.send_message(
             ADMIN_CHAT_ID,
             admin_text,
-            reply_markup=report_admin_keyboard(0),
+            reply_markup=report_admin_keyboard(0, report_format == "ticket"),
             **kwargs
         )
     except Exception:
@@ -4607,19 +4636,22 @@ async def submit_report(message: Message, session_data: dict):
             """
             INSERT INTO reports
                 (telegram_id, telegram_username, minecraft_nickname, report_type,
-                 report_text, admin_message_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                 report_text, admin_message_id, status, created_at, format)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 user.id, user.username or "", nickname or "",
-                report_type, report_text, sent.message_id, moscow_iso(moscow_now())
+                report_type, report_text, sent.message_id, moscow_iso(moscow_now()),
+                report_format
             )
         )
         report_id = int(cur.lastrowid)
         conn.commit()
 
     # Заменяем временный callback ID на настоящий ID репорта.
-    await sent.edit_reply_markup(reply_markup=report_admin_keyboard(report_id))
+    await sent.edit_reply_markup(
+        reply_markup=report_admin_keyboard(report_id, report_format == "ticket")
+    )
 
     evidence = session_data.get("evidence", [])
     evidence_errors = 0
@@ -4754,14 +4786,30 @@ async def report_callback(callback: CallbackQuery):
                 "Техническая проблема" if choice == "technical"
                 else "Жалоба на игрока (сервер)"
             )
-            prompt_text = (
+            if choice == "technical":
+                prompt = await callback.message.edit_text(
+                    "Какой формат вам подойдет больше?\n"
+                    "Тикеты — вы можете обсуждать свою проблему с администрацией.",
+                    reply_markup=report_choice_keyboard("format")
+                )
+                save_report_session(callback.from_user.id, "format", prompt.message_id, session_data)
+            else:
+                prompt = await callback.message.edit_text(
+                    "<i>На кого и почему вы жалуетесь?</i>\n"
+                    "Ответьте одним сообщением в ответ на это сообщение."
+                )
+                save_report_session(callback.from_user.id, "await_text", prompt.message_id, session_data)
+
+        elif data.startswith("report_format:"):
+            choice = data.split(":", 1)[1]
+            if choice not in {"ticket", "ordinary"}:
+                await callback.answer("Неизвестный вариант.", show_alert=True)
+                return
+            session_data["format"] = choice
+            prompt = await callback.message.edit_text(
                 "<i>С какой проблемой вы столкнулись?</i>\n"
                 "Ответьте одним сообщением в ответ на это сообщение."
-                if choice == "technical"
-                else "<i>На кого и почему вы жалуетесь?</i>\n"
-                "Ответьте одним сообщением в ответ на это сообщение."
             )
-            prompt = await callback.message.edit_text(prompt_text)
             save_report_session(callback.from_user.id, "await_text", prompt.message_id, session_data)
 
         elif data.startswith("report_evidence:"):
