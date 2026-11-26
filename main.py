@@ -3732,6 +3732,10 @@ async def cmd_warn(message: Message):
                 "UPDATE warn_history SET status='expired' WHERE telegram_id=? AND status='active'",
                 (target_id,)
             )
+            conn.execute(
+                "DELETE FROM whitelist_pending WHERE telegram_id=?",
+                (target_id,)
+            )
             conn.commit()
 
         server_results = []
@@ -4009,6 +4013,10 @@ async def cmd_ban(message: Message):
         )
         conn.execute(
             "UPDATE users SET rank='banned' WHERE telegram_id=?",
+            (target["telegram_id"],)
+        )
+        conn.execute(
+            "DELETE FROM whitelist_pending WHERE telegram_id=?",
             (target["telegram_id"],)
         )
         conn.commit()
