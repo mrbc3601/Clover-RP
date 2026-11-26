@@ -322,6 +322,51 @@ def init_db():
         """)
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_members (
+                chat_id INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                telegram_username TEXT,
+                is_bot INTEGER NOT NULL DEFAULT 0,
+                is_member INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, telegram_id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_cooldowns (
+                chat_id INTEGER PRIMARY KEY,
+                last_called_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_sessions (
+                telegram_id INTEGER PRIMARY KEY,
+                step TEXT NOT NULL,
+                prompt_message_id INTEGER,
+                data_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                telegram_username TEXT,
+                minecraft_nickname TEXT,
+                report_type TEXT NOT NULL,
+                report_text TEXT NOT NULL,
+                admin_message_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'pending',
+                decision_admin_id INTEGER,
+                reject_prompt_message_id INTEGER,
+                reject_admin_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
@@ -821,6 +866,18 @@ class LegacyAccessMiddleware(BaseMiddleware):
             return None
 
         if (
+            not user.is_bot
+            and event.chat.id in {MAIN_CHAT_ID, ADMIN_CHAT_ID}
+        ):
+            record_chat_member(
+                event.chat.id,
+                user.id,
+                user.username or "",
+                is_bot=False,
+                is_member=True
+            )
+
+        if (
             MAIN_CHAT_ID
             and event.chat.id == MAIN_CHAT_ID
             and not user.is_bot
@@ -845,26 +902,54 @@ class LegacyAccessMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+def record_chat_member(chat_id: int, telegram_id: int, username: str, is_bot: bool, is_member: bool):
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_members
+                (chat_id, telegram_id, telegram_username, is_bot, is_member, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, telegram_id) DO UPDATE SET
+                telegram_username = excluded.telegram_username,
+                is_bot = excluded.is_bot,
+                is_member = excluded.is_member,
+                updated_at = excluded.updated_at
+            """,
+            (
+                chat_id, telegram_id, username or "", int(is_bot),
+                int(is_member), moscow_iso(moscow_now())
+            )
+        )
+        conn.commit()
+
+
 async def track_legacy_chat_member(event: ChatMemberUpdated):
-    if not MAIN_CHAT_ID or event.chat.id != MAIN_CHAT_ID:
+    if event.chat.id not in {MAIN_CHAT_ID, ADMIN_CHAT_ID}:
         return
 
     member = event.new_chat_member
     user = member.user
-    if user.is_bot:
-        return
-
     is_member = member.status in {"creator", "administrator", "member"}
     if member.status == "restricted":
         is_member = bool(getattr(member, "is_member", False))
 
-    if is_member:
-        ensure_legacy_user(user.id, user.username or "")
-        user_row = get_user(user.id)
-        if user_row and user_row["rank"] not in {"legacy", "banned", "warnbanned"}:
-            nickname = user_row["minecraft_nickname"]
-            if nickname:
-                schedule_whitelist_after_join(user.id, nickname)
+    record_chat_member(
+        event.chat.id,
+        user.id,
+        user.username or "",
+        user.is_bot,
+        is_member
+    )
+
+    if user.is_bot or event.chat.id != MAIN_CHAT_ID or not is_member:
+        return
+
+    ensure_legacy_user(user.id, user.username or "")
+    user_row = get_user(user.id)
+    if user_row and user_row["rank"] not in {"legacy", "banned", "warnbanned"}:
+        nickname = user_row["minecraft_nickname"]
+        if nickname:
+            schedule_whitelist_after_join(user.id, nickname)
 
 
 def schedule_whitelist_after_join(telegram_id: int, nickname: str):
@@ -3883,6 +3968,521 @@ async def cmd_java(message: Message):
         )
 
 
+
+
+# =====================================================
+# /REPORT — PLAYER REPORTS
+# =====================================================
+
+REPORT_ADMIN_RANKS = {"moder", "m_admin", "admin", "tech_admin", "st_admin", "owner"}
+
+
+def save_report_session(telegram_id: int, step: str, prompt_message_id: int | None, data: dict):
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO report_sessions(telegram_id, step, prompt_message_id, data_json)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                step = excluded.step,
+                prompt_message_id = excluded.prompt_message_id,
+                data_json = excluded.data_json
+            """,
+            (telegram_id, step, prompt_message_id, json.dumps(data, ensure_ascii=False))
+        )
+        conn.commit()
+
+
+def get_report_session(telegram_id: int):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM report_sessions WHERE telegram_id = ?",
+            (telegram_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "step": row["step"],
+        "prompt_message_id": row["prompt_message_id"],
+        "data": json.loads(row["data_json"] or "{}")
+    }
+
+
+def delete_report_session(telegram_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM report_sessions WHERE telegram_id = ?", (telegram_id,))
+        conn.commit()
+
+
+def report_choice_keyboard(kind: str):
+    if kind == "location":
+        rows = [[
+            InlineKeyboardButton(text="На сервере", callback_data="report_location:server"),
+            InlineKeyboardButton(text="В чате", callback_data="report_location:chat")
+        ]]
+    elif kind == "category":
+        rows = [[
+            InlineKeyboardButton(text="Технические ошибки", callback_data="report_category:technical")
+        ], [
+            InlineKeyboardButton(text="Жалоба на игрока", callback_data="report_category:player")
+        ]]
+    elif kind == "evidence":
+        rows = [[
+            InlineKeyboardButton(text="Да", callback_data="report_evidence:yes"),
+            InlineKeyboardButton(text="Нет", callback_data="report_evidence:no")
+        ]]
+    elif kind == "media_done":
+        rows = [[InlineKeyboardButton(text="Готово", callback_data="report_media_done")]]
+    else:
+        rows = []
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def report_admin_keyboard(report_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Проблема решена", callback_data=f"report_resolve:{report_id}"),
+        InlineKeyboardButton(text="❌ Отклонить жалобу", callback_data=f"report_reject:{report_id}")
+    ]])
+
+
+async def cmd_report(message: Message):
+    if not message.from_user:
+        return
+    if message.chat.type != "private":
+        await message.reply("Для подачи жалобы напишите боту в личные сообщения: /report")
+        return
+    if get_report_session(message.from_user.id):
+        await message.reply("У вас уже есть незавершённая жалоба. Продолжите отвечать на вопросы бота.")
+        return
+    prompt = await message.answer(
+        "Где случилась проблема?",
+        reply_markup=report_choice_keyboard("location")
+    )
+    save_report_session(message.from_user.id, "location", prompt.message_id, {})
+
+
+async def submit_report(message: Message, session_data: dict):
+    if not ADMIN_CHAT_ID:
+        await message.answer("Не настроен ADMIN_CHAT_ID. Жалобу отправить не удалось.")
+        delete_report_session(message.from_user.id)
+        return
+
+    user = message.from_user
+    user_row = get_user(user.id)
+    nickname = user_row["minecraft_nickname"] if user_row else None
+    report_type = session_data["report_type"]
+    report_text = session_data["report_text"]
+    username = "@" + user.username if user.username else "не указан"
+
+    admin_text = (
+        "<b>Новый репорт CloverTeam</b>\n\n"
+        f"Репорт от игрока: {safe_html(username)}\n"
+        f"Никнейм: <code>{safe_html(nickname or 'не указан')}</code>\n"
+        f"Тип: <b>{safe_html(report_type)}</b>\n"
+        f"Жалоба:\n{safe_html(report_text)}"
+    )
+    kwargs = {}
+    if REPORT_THREAD_ID:
+        kwargs["message_thread_id"] = REPORT_THREAD_ID
+
+    try:
+        sent = await message.bot.send_message(
+            ADMIN_CHAT_ID,
+            admin_text,
+            reply_markup=report_admin_keyboard(0),
+            **kwargs
+        )
+    except Exception:
+        log.exception("Could not forward report to admin chat")
+        await message.answer("Не удалось отправить жалобу администрации. Попробуйте позже.")
+        delete_report_session(user.id)
+        return
+
+    with db_connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO reports
+                (telegram_id, telegram_username, minecraft_nickname, report_type,
+                 report_text, admin_message_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                user.id, user.username or "", nickname or "",
+                report_type, report_text, sent.message_id, moscow_iso(moscow_now())
+            )
+        )
+        report_id = int(cur.lastrowid)
+        conn.commit()
+
+    # Заменяем временный callback ID на настоящий ID репорта.
+    await sent.edit_reply_markup(reply_markup=report_admin_keyboard(report_id))
+
+    evidence = session_data.get("evidence", [])
+    evidence_errors = 0
+    for item in evidence:
+        try:
+            if item["kind"] == "photo":
+                await message.bot.send_photo(
+                    ADMIN_CHAT_ID,
+                    item["file_id"],
+                    message_thread_id=REPORT_THREAD_ID or None
+                )
+            else:
+                await message.bot.send_video(
+                    ADMIN_CHAT_ID,
+                    item["file_id"],
+                    message_thread_id=REPORT_THREAD_ID or None
+                )
+        except Exception:
+            evidence_errors += 1
+            log.exception("Could not forward report evidence for report %s", report_id)
+
+    delete_report_session(user.id)
+    if evidence_errors:
+        await message.answer(
+            f"Жалоба №{report_id} отправлена, но часть доказательств не удалось переслать."
+        )
+    else:
+        await message.answer(f"Ваша жалоба №{report_id} отправлена администрации.")
+
+
+async def report_private_input(message: Message) -> bool:
+    if message.chat.type != "private" or not message.from_user:
+        return False
+    session = get_report_session(message.from_user.id)
+    if not session:
+        return False
+
+    step = session["step"]
+    data = session["data"]
+
+    if step == "await_text":
+        if (
+            not message.reply_to_message
+            or message.reply_to_message.message_id != session["prompt_message_id"]
+        ):
+            return True
+        if not message.text or not message.text.strip():
+            await message.reply("Опишите проблему одним текстовым сообщением в ответ на вопрос бота.")
+            return True
+        data["report_text"] = message.text.strip()[:4000]
+        prompt = await message.answer(
+            "У вас есть скриншот или видео в качестве доказательства своей проблемы?",
+            reply_markup=report_choice_keyboard("evidence")
+        )
+        save_report_session(message.from_user.id, "evidence_choice", prompt.message_id, data)
+        return True
+
+    if step == "await_media":
+        if (
+            not message.reply_to_message
+            or message.reply_to_message.message_id != session["prompt_message_id"]
+        ):
+            return True
+        item = None
+        if message.photo:
+            item = {"kind": "photo", "file_id": message.photo[-1].file_id}
+        elif message.video:
+            item = {"kind": "video", "file_id": message.video.file_id}
+        if not item:
+            await message.reply("Пришлите фото или видео в ответ на сообщение бота.")
+            return True
+        data.setdefault("evidence", []).append(item)
+        await message.reply(
+            "Доказательство добавлено. Можете отправить ещё фото/видео или нажать «Готово».",
+            reply_markup=report_choice_keyboard("media_done")
+        )
+        return True
+
+    return False
+
+
+async def report_callback(callback: CallbackQuery):
+    if not callback.from_user:
+        return
+    data = callback.data or ""
+
+    if data.startswith("report_location:") or data.startswith("report_category:") or data.startswith("report_evidence:") or data == "report_media_done":
+        session = get_report_session(callback.from_user.id)
+        if not session:
+            await callback.answer("Сессия жалобы не найдена.", show_alert=True)
+            return
+        session_data = session["data"]
+
+        if data.startswith("report_location:"):
+            choice = data.split(":", 1)[1]
+            if choice == "server":
+                prompt = await callback.message.edit_text(
+                    "Из-за чего вы жалуетесь?",
+                    reply_markup=report_choice_keyboard("category")
+                )
+                session_data["location"] = "server"
+                save_report_session(callback.from_user.id, "category", prompt.message_id, session_data)
+            elif choice == "chat":
+                prompt = await callback.message.edit_text(
+                    "На кого и почему вы жалуетесь? Ответьте текстом на это сообщение."
+                )
+                session_data["location"] = "chat"
+                session_data["report_type"] = "Жалоба на игрока (чат)"
+                save_report_session(callback.from_user.id, "await_text", prompt.message_id, session_data)
+            else:
+                await callback.answer("Неизвестный вариант.", show_alert=True)
+                return
+
+        elif data.startswith("report_category:"):
+            choice = data.split(":", 1)[1]
+            if choice not in {"technical", "player"}:
+                await callback.answer("Неизвестный вариант.", show_alert=True)
+                return
+            session_data["report_type"] = (
+                "Техническая проблема" if choice == "technical"
+                else "Жалоба на игрока (сервер)"
+            )
+            prompt = await callback.message.edit_text(
+                "Опишите проблему одним сообщением в ответ на это сообщение."
+            )
+            save_report_session(callback.from_user.id, "await_text", prompt.message_id, session_data)
+
+        elif data.startswith("report_evidence:"):
+            choice = data.split(":", 1)[1]
+            if choice == "no":
+                await callback.message.edit_reply_markup(reply_markup=None)
+                fake_message = callback.message
+                # Use the original private chat message as the sender context.
+                class _ReportMessage:
+                    pass
+                proxy = _ReportMessage()
+                proxy.from_user = callback.from_user
+                proxy.bot = callback.bot
+                proxy.answer = callback.message.answer
+                await submit_report(proxy, session_data)
+            elif choice == "yes":
+                prompt = await callback.message.edit_text(
+                    "Пришлите скриншот или видео в ответ на это сообщение. "
+                    "Можно отправить несколько файлов, затем нажмите «Готово».",
+                    reply_markup=report_choice_keyboard("media_done")
+                )
+                save_report_session(callback.from_user.id, "await_media", prompt.message_id, session_data)
+            else:
+                await callback.answer("Неизвестный вариант.", show_alert=True)
+                return
+
+        elif data == "report_media_done":
+            if not session_data.get("evidence"):
+                await callback.answer("Сначала отправьте хотя бы одно фото или видео.", show_alert=True)
+                return
+            await callback.message.edit_reply_markup(reply_markup=None)
+            class _ReportMessage:
+                pass
+            proxy = _ReportMessage()
+            proxy.from_user = callback.from_user
+            proxy.bot = callback.bot
+            proxy.answer = callback.message.answer
+            await submit_report(proxy, session_data)
+
+        await callback.answer()
+        return
+
+    if data.startswith("report_resolve:") or data.startswith("report_reject:"):
+        if get_rest_period(callback.from_user.id):
+            await callback.answer("На время реста действие недоступно.", show_alert=True)
+            return
+        admin = get_user(callback.from_user.id)
+        if not admin or admin["rank"] not in REPORT_ADMIN_RANKS:
+            await callback.answer("Недостаточно прав для обработки жалоб.", show_alert=True)
+            return
+        try:
+            action, report_id_text = data.split(":", 1)
+            report_id = int(report_id_text)
+        except ValueError:
+            await callback.answer("Некорректная жалоба.", show_alert=True)
+            return
+
+        with db_connect() as conn:
+            report = conn.execute(
+                "SELECT * FROM reports WHERE id = ? AND status = 'pending'",
+                (report_id,)
+            ).fetchone()
+            if not report:
+                await callback.answer("Жалоба уже обработана.", show_alert=True)
+                return
+
+            if action == "report_resolve":
+                conn.execute(
+                    "UPDATE reports SET status='resolved', decision_admin_id=? WHERE id=? AND status='pending'",
+                    (callback.from_user.id, report_id)
+                )
+                conn.commit()
+            else:
+                conn.execute(
+                    "UPDATE reports SET status='awaiting_rejection_reason', reject_admin_id=? WHERE id=? AND status='pending'",
+                    (callback.from_user.id, report_id)
+                )
+                conn.commit()
+
+        admin_label = "@" + callback.from_user.username if callback.from_user.username else str(callback.from_user.id)
+        if action == "report_resolve":
+            try:
+                await callback.bot.send_message(report["telegram_id"], "Администрация решила вашу проблему.")
+            except Exception:
+                log.warning("Could not notify report author %s", report["telegram_id"], exc_info=True)
+            updated = (callback.message.text or "") + f"\n\nРешен {safe_html(admin_label)}"
+            await callback.message.edit_text(updated, reply_markup=None)
+            await callback.answer("Жалоба отмечена как решённая.")
+        else:
+            prompt_kwargs = {"message_thread_id": REPORT_THREAD_ID} if REPORT_THREAD_ID else {}
+            prompt = await callback.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"Укажите причину отклонения жалобы №{report_id}. Ответьте на это сообщение.",
+                **prompt_kwargs
+            )
+            with db_connect() as conn:
+                conn.execute(
+                    "UPDATE reports SET reject_prompt_message_id=? WHERE id=? AND status='awaiting_rejection_reason'",
+                    (prompt.message_id, report_id)
+                )
+                conn.commit()
+            await callback.answer("Ожидаю причину отклонения.")
+        return
+
+
+async def report_rejection_reply(message: Message) -> bool:
+    if not message.from_user or not message.reply_to_message or not message.text:
+        return False
+    reason = message.text.strip()
+    if not reason or len(reason) > 1000:
+        return False
+    with db_connect() as conn:
+        report = conn.execute(
+            """
+            SELECT * FROM reports
+            WHERE reject_prompt_message_id = ?
+              AND reject_admin_id = ?
+              AND status = 'awaiting_rejection_reason'
+            """,
+            (message.reply_to_message.message_id, message.from_user.id)
+        ).fetchone()
+        if not report:
+            return False
+        changed = conn.execute(
+            """
+            UPDATE reports
+            SET status='rejected', decision_admin_id=?
+            WHERE id=? AND status='awaiting_rejection_reason'
+            """,
+            (message.from_user.id, report["id"])
+        ).rowcount
+        conn.commit()
+        if changed != 1:
+            return True
+
+    try:
+        await message.bot.send_message(
+            report["telegram_id"],
+            "Ваша жалоба отклонена.\nПричина: " + safe_html(reason)
+        )
+    except Exception:
+        log.warning("Could not notify rejected report author %s", report["telegram_id"], exc_info=True)
+
+    admin_label = "@" + message.from_user.username if message.from_user.username else str(message.from_user.id)
+    try:
+        await message.bot.edit_message_text(
+            chat_id=ADMIN_CHAT_ID,
+            message_id=report["admin_message_id"],
+            text=(await message.bot.get_message if False else ""),
+            reply_markup=None
+        )
+    except Exception:
+        # Ниже обновляем карточку через сохранённый текст сообщения, если Telegram не дал его получить.
+        pass
+    await message.reply(f"Жалоба №{report['id']} отклонена. Причина отправлена автору.")
+    return True
+
+
+async def cmd_call(message: Message):
+    if not message.from_user or message.chat.id not in {MAIN_CHAT_ID, ADMIN_CHAT_ID}:
+        return
+    actor = get_user(message.from_user.id)
+    if not actor or actor["rank"] not in STAFF_RANKS or get_rest_period(message.from_user.id):
+        await message.reply("Команда /call доступна только сотрудникам CloverTeam.")
+        return
+
+    chat_id = message.chat.id
+    now = moscow_now()
+    with db_connect() as conn:
+        cooldown = conn.execute(
+            "SELECT last_called_at FROM call_cooldowns WHERE chat_id=?",
+            (chat_id,)
+        ).fetchone()
+        if cooldown:
+            ready = datetime.fromisoformat(cooldown["last_called_at"]) + timedelta(minutes=15)
+            if now < ready:
+                seconds = int((ready - now).total_seconds())
+                minutes, seconds = divmod(seconds, 60)
+                await message.reply(f"Зазывало можно использовать снова через {minutes} мин. {seconds} сек.")
+                return
+
+        if chat_id == ADMIN_CHAT_ID:
+            rows = conn.execute(
+                """
+                SELECT cm.telegram_id, cm.telegram_username
+                FROM chat_members cm
+                JOIN users u ON u.telegram_id = cm.telegram_id
+                WHERE cm.chat_id=? AND cm.is_member=1 AND cm.is_bot=0
+                  AND u.rank IN ('helper','montash','moder','eventor','m_admin','tech_admin','admin','st_admin','owner')
+                ORDER BY cm.telegram_id
+                """,
+                (chat_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT telegram_id, telegram_username
+                FROM chat_members
+                WHERE chat_id=? AND is_member=1 AND is_bot=0
+                ORDER BY telegram_id
+                """,
+                (chat_id,)
+            ).fetchall()
+
+        conn.execute(
+            """
+            INSERT INTO call_cooldowns(chat_id, last_called_at)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET last_called_at=excluded.last_called_at
+            """,
+            (chat_id, moscow_iso(now))
+        )
+        conn.commit()
+
+    unique = {}
+    for row in rows:
+        unique[int(row["telegram_id"])] = row["telegram_username"] or ""
+    recipients = list(unique.items())
+    if not recipients:
+        await message.reply(
+            "Пока некого отметить: бот ещё не собрал список участников этого чата. "
+            "Telegram не предоставляет ботам полный список всех участников."
+        )
+        return
+
+    chunks = [recipients[i:i + 25] for i in range(0, len(recipients), 25)]
+    for chunk in chunks:
+        mentions = " ".join(
+            f'<a href="tg://user?id={telegram_id}">{safe_html("@" + username if username else "Участник")}</a>'
+            for telegram_id, username in chunk
+        )
+        kwargs = {}
+        if message.message_thread_id:
+            kwargs["message_thread_id"] = message.message_thread_id
+        await message.bot.send_message(
+            chat_id,
+            "🔔 Зазывало! " + mentions,
+            **kwargs
+        )
+
+
+
 # =====================================================
 # PRIVATE MESSAGE ROUTER
 # =====================================================
@@ -3890,6 +4490,10 @@ async def cmd_java(message: Message):
 async def private_reply_router(message: Message):
 
     if message.chat.type != "private":
+        return
+
+    handled = await report_private_input(message)
+    if handled:
         return
 
     handled = await clan_creation_reply(message)
@@ -3910,6 +4514,10 @@ async def private_reply_router(message: Message):
 async def admin_reply_router(message: Message):
 
     if message.chat.id != ADMIN_CHAT_ID:
+        return
+
+    handled = await report_rejection_reply(message)
+    if handled:
         return
 
     handled = await clan_setup_reply(message)
@@ -5327,6 +5935,9 @@ async def main():
         Command("reg")
     )
 
+    dp.message.register(cmd_report, Command("report"))
+    dp.message.register(cmd_call, Command("call"))
+
     dp.message.register(
         cmd_unreg,
         Command("unreg")
@@ -5439,6 +6050,8 @@ async def main():
         application_decision,
         F.data.startswith("app_")
     )
+
+    dp.callback_query.register(report_callback, F.data.startswith("report_"))
 
     dp.callback_query.register(clan_rules_callback, F.data.startswith("clan_rules_"))
     dp.callback_query.register(clan_verify_callback, F.data.startswith("clan_verify:"))
