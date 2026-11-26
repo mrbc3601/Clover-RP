@@ -4482,7 +4482,7 @@ async def cmd_java(message: Message):
 # /REPORT — PLAYER REPORTS
 # =====================================================
 
-REPORT_ADMIN_RANKS = {"moder", "m_admin", "admin", "tech_admin", "st_admin", "owner"}
+REPORT_ADMIN_RANKS = {"moder", "eventor", "m_admin", "admin", "tech_admin", "st_admin", "owner"}
 
 
 def save_report_session(telegram_id: int, step: str, prompt_message_id: int | None, data: dict):
