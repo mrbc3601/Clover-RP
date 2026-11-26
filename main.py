@@ -4990,6 +4990,7 @@ async def cmd_call(message: Message):
     await sync_known_chat_members(message.bot, chat_id)
     now = moscow_now()
     with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         cooldown = conn.execute(
             "SELECT last_called_at FROM call_cooldowns WHERE chat_id=?",
             (chat_id,)
@@ -5025,6 +5026,19 @@ async def cmd_call(message: Message):
                 (chat_id,)
             ).fetchall()
 
+        if rows:
+            conn.execute(
+                """
+                INSERT INTO call_cooldowns(chat_id, last_called_at)
+                VALUES (?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET last_called_at=excluded.last_called_at
+                """,
+                (chat_id, moscow_iso(now))
+            )
+            conn.commit()
+        else:
+            conn.rollback()
+
     unique = {}
     for row in rows:
         unique[int(row["telegram_id"])] = row["telegram_username"] or ""
@@ -5035,17 +5049,6 @@ async def cmd_call(message: Message):
             "Telegram не предоставляет ботам полный список всех участников."
         )
         return
-
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO call_cooldowns(chat_id, last_called_at)
-            VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET last_called_at=excluded.last_called_at
-            """,
-            (chat_id, moscow_iso(now))
-        )
-        conn.commit()
 
     chunks = [recipients[i:i + 25] for i in range(0, len(recipients), 25)]
     for chunk in chunks:
