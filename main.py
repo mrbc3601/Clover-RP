@@ -454,6 +454,66 @@ def init_db():
             ON warn_history(telegram_id, status, expires_at)
         """)
 
+        # Перенос старых бессрочных warnbanned-записей на семидневную схему.
+        # Дата последнего варна используется как начало срока; старые сроки уже истекут автоматически.
+        legacy_warnbans = conn.execute(
+            """
+            SELECT telegram_id, minecraft_nickname
+            FROM users
+            WHERE rank='warnbanned'
+              AND NOT EXISTS (
+                  SELECT 1 FROM bans b WHERE b.telegram_id=users.telegram_id
+              )
+            """
+        ).fetchall()
+        for legacy_ban in legacy_warnbans:
+            last_warn = conn.execute(
+                """
+                SELECT issued_at, admin_id
+                FROM warn_history
+                WHERE telegram_id=?
+                ORDER BY issued_at DESC, id DESC
+                LIMIT 1
+                """,
+                (legacy_ban["telegram_id"],)
+            ).fetchone()
+            try:
+                ban_start = (
+                    datetime.fromisoformat(last_warn["issued_at"]).astimezone(MOSCOW_TZ)
+                    if last_warn else moscow_now()
+                )
+            except Exception:
+                ban_start = moscow_now()
+            ban_end = ban_start + timedelta(days=7)
+            ban_start_iso = moscow_iso(ban_start)
+            ban_end_iso = moscow_iso(ban_end)
+            reason = "Достижение максимального количества варнов"
+            admin_id = int(last_warn["admin_id"]) if last_warn else 0
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO bans
+                    (telegram_id, reason, created_at, expires_at, minecraft_nickname,
+                     ban_type, previous_rank, admin_id, unbanned_at)
+                VALUES (?, ?, ?, ?, ?, 'warn', 'legacy', ?, NULL)
+                """,
+                (
+                    legacy_ban["telegram_id"], reason, ban_start_iso, ban_end_iso,
+                    legacy_ban["minecraft_nickname"], admin_id
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO ban_history
+                    (telegram_id, admin_id, reason, ban_type, created_at, expires_at, status)
+                VALUES (?, ?, ?, 'warn', ?, ?, 'active')
+                """,
+                (
+                    legacy_ban["telegram_id"], admin_id, reason,
+                    ban_start_iso, ban_end_iso
+                )
+            )
+
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS rest_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -791,6 +851,11 @@ async def ban_expiration_worker(bot: Bot):
                             "UPDATE users SET rank='legacy' WHERE telegram_id=? AND rank='warnbanned'",
                             (telegram_id,)
                         )
+                        conn.execute(
+                            "UPDATE warn_history SET status='expired' WHERE telegram_id=? AND status='active'",
+                            (telegram_id,)
+                        )
+                        refresh_warn_count(conn, telegram_id)
                         conn.execute(
                             "UPDATE ban_history SET status='expired' "
                             "WHERE telegram_id=? AND ban_type='warn' AND status='active' "
