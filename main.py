@@ -3482,7 +3482,7 @@ async def cmd_warn(message: Message):
     if actor_rank == "eventor" or actor_rank not in WARN_RANK_LEVEL and actor_rank != "owner":
         await message.reply("У вас недостаточно прав для использования этой команды.")
         return
-    if actor_rank not in {"moder", "admin", "tech_admin", "st_admin", "owner"}:
+    if actor_rank not in {"moder", "m_admin", "admin", "tech_admin", "st_admin", "owner"}:
         await message.reply("Выдавать варны могут администраторы ранга moder и выше (eventor исключён).")
         return
 
@@ -3671,7 +3671,7 @@ async def cmd_unwarn(message: Message):
 
     actor_rank = actor.get("rank")
     if actor_rank == "eventor" or actor_rank not in {
-        "moder", "admin", "tech_admin", "st_admin", "owner"
+        "moder", "m_admin", "admin", "tech_admin", "st_admin", "owner"
     }:
         await message.reply(
             "Снимать варны могут администраторы ранга moder и выше (eventor исключён)."
@@ -4385,16 +4385,23 @@ async def report_rejection_reply(message: Message) -> bool:
         log.warning("Could not notify rejected report author %s", report["telegram_id"], exc_info=True)
 
     admin_label = "@" + message.from_user.username if message.from_user.username else str(message.from_user.id)
+    updated_text = (
+        "<b>Новый репорт CloverTeam</b>\\n\\n"
+        f"Репорт от игрока: {safe_html('@' + (report['telegram_username'] or '') if report['telegram_username'] else 'не указан')}\\n"
+        f"Никнейм: <code>{safe_html(report['minecraft_nickname'] or 'не указан')}</code>\\n"
+        f"Тип: <b>{safe_html(report['report_type'])}</b>\\n"
+        f"Жалоба:\\n{safe_html(report['report_text'])}\\n\\n"
+        f"Отклонен {safe_html(admin_label)}"
+    )
     try:
         await message.bot.edit_message_text(
             chat_id=ADMIN_CHAT_ID,
             message_id=report["admin_message_id"],
-            text=(await message.bot.get_message if False else ""),
+            text=updated_text,
             reply_markup=None
         )
     except Exception:
-        # Ниже обновляем карточку через сохранённый текст сообщения, если Telegram не дал его получить.
-        pass
+        log.exception("Could not update rejected report card %s", report["id"])
     await message.reply(f"Жалоба №{report['id']} отклонена. Причина отправлена автору.")
     return True
 
@@ -5845,7 +5852,7 @@ async def cmd_addadmins(message: Message):
         return
     parts = extract_command(message).split()
     if len(parts) != 2:
-        await message.reply("Использование: /addadmins Telegram_ID|@username|MinecraftNick rank\nРанги: helper, moder, eventor, tech_admin, admin, st_admin, owner")
+        await message.reply("Использование: /addadmins Telegram_ID|@username|MinecraftNick rank\nРанги: helper, montash, eventor, moder, m_admin, admin, tech_admin, st_admin, owner")
         return
     target = resolve_registered_player(parts[0])
     rank = parts[1].lower()
