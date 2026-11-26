@@ -5717,7 +5717,7 @@ async def clan_verify_callback(callback: CallbackQuery):
     if not callback.from_user:
         return
     actor = get_user(callback.from_user.id)
-    if not actor or actor["rank"] not in {"admin", "st_admin", "owner"}:
+    if not actor or actor["rank"] not in {"admin", "tech_admin", "st_admin", "owner"}:
         await callback.answer("Верифицировать кланы могут только admin и выше.", show_alert=True)
         return
     try:
@@ -5789,7 +5789,7 @@ async def cmd_lrest(message: Message):
         return
     user = get_user(message.from_user.id)
     if not user or user["rank"] not in {
-        "helper", "moder", "eventor", "tech_admin", "admin", "st_admin", "owner"
+        "helper", "montash", "moder", "eventor", "m_admin", "tech_admin", "admin", "st_admin", "owner"
     }:
         await message.reply("Команда доступна администрации ранга helper и выше.")
         return
@@ -6005,7 +6005,7 @@ async def cmd_delclan(message: Message):
         return
     actor = get_account(message.from_user.id)
     own = clan_member(message.from_user.id)
-    allowed = (own and own["clan_id"] == clan_id and own["role"] == "leader") or (actor and actor["rank"] in {"moder", "eventor", "tech_admin", "admin", "st_admin", "owner"})
+    allowed = (own and own["clan_id"] == clan_id and own["role"] == "leader") or (actor and actor["rank"] in {"moder", "eventor", "m_admin", "tech_admin", "admin", "st_admin", "owner"})
     if not allowed:
         await message.reply("Удалить этот клан может его лидер или администрация ранга moder и выше.")
         return
