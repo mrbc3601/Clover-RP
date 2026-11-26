@@ -1120,6 +1120,20 @@ async def whitelist_worker():
             for item in due_rows:
                 telegram_id = int(item["telegram_id"])
                 nickname = item["minecraft_nickname"]
+                current_user = get_user(telegram_id)
+                if (
+                    not current_user
+                    or not current_user["minecraft_nickname"]
+                    or current_user["minecraft_nickname"].casefold() != nickname.casefold()
+                    or is_banned(telegram_id)
+                ):
+                    with db_connect() as conn:
+                        conn.execute(
+                            "DELETE FROM whitelist_pending WHERE telegram_id=? AND status='pending'",
+                            (telegram_id,)
+                        )
+                        conn.commit()
+                    continue
                 try:
                     await rcon_command(f"swl add {nickname}")
                     await rcon_command("swl reload")
@@ -4920,16 +4934,6 @@ async def cmd_call(message: Message):
                 (chat_id,)
             ).fetchall()
 
-        conn.execute(
-            """
-            INSERT INTO call_cooldowns(chat_id, last_called_at)
-            VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET last_called_at=excluded.last_called_at
-            """,
-            (chat_id, moscow_iso(now))
-        )
-        conn.commit()
-
     unique = {}
     for row in rows:
         unique[int(row["telegram_id"])] = row["telegram_username"] or ""
@@ -4940,6 +4944,17 @@ async def cmd_call(message: Message):
             "Telegram не предоставляет ботам полный список всех участников."
         )
         return
+
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO call_cooldowns(chat_id, last_called_at)
+            VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET last_called_at=excluded.last_called_at
+            """,
+            (chat_id, moscow_iso(now))
+        )
+        conn.commit()
 
     chunks = [recipients[i:i + 25] for i in range(0, len(recipients), 25)]
     for chunk in chunks:
@@ -4955,6 +4970,7 @@ async def cmd_call(message: Message):
             "🔔 Зазывало! " + mentions,
             **kwargs
         )
+        await asyncio.sleep(0.2)
 
 
 
