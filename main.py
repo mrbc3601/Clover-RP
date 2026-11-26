@@ -56,7 +56,7 @@ DB_PATH = BASE_DIR / os.getenv(
 
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 ADMIN_THREAD_ID = int(os.getenv("ADMIN_THREAD_ID", "0"))
-REPORT_THREAD_ID = int(os.getenv("REPORT_THREAD_ID", "0"))
+REPORT_THREAD_ID = int(os.getenv("REPORT_THREAD_ID", "0") or "0")
 MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "0"))
 
 APPLICATION_THREAD_ID = int(
@@ -1700,6 +1700,22 @@ async def cmd_reg(message: Message):
     existing = get_user(telegram_id)
     expired_warn_ban = is_expired_warn_ban(telegram_id)
     legacy = bool(existing and existing["rank"] == "legacy" and not expired_warn_ban)
+
+    if expired_warn_ban:
+        try:
+            member = await message.bot.get_chat_member(MAIN_CHAT_ID, telegram_id)
+            expired_user_is_member = (
+                member.status in {"creator", "administrator", "member"}
+                or (member.status == "restricted" and getattr(member, "is_member", False))
+            )
+        except Exception:
+            expired_user_is_member = False
+        if not expired_user_is_member:
+            await message.reply(
+                "Срок блокировки закончился, но для повторной регистрации сначала "
+                "вступите обратно в основной чат CloverTeam."
+            )
+            return
 
     if existing and not legacy and not expired_warn_ban:
         await message.reply(
@@ -4757,6 +4773,9 @@ async def report_callback(callback: CallbackQuery):
 
 async def report_rejection_reply(message: Message) -> bool:
     if not message.from_user or not message.reply_to_message or not message.text:
+        return False
+    admin = get_user(message.from_user.id)
+    if not admin or admin["rank"] not in REPORT_ADMIN_RANKS or get_rest_period(message.from_user.id):
         return False
     reason = message.text.strip()
     if not reason or len(reason) > 1000:
