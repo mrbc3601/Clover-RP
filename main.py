@@ -4827,26 +4827,31 @@ async def report_callback(callback: CallbackQuery):
             return
 
         with db_connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             report = conn.execute(
                 "SELECT * FROM reports WHERE id = ? AND status = 'pending'",
                 (report_id,)
             ).fetchone()
             if not report:
+                conn.rollback()
                 await callback.answer("Жалоба уже обработана.", show_alert=True)
                 return
 
             if action == "report_resolve":
-                conn.execute(
+                changed = conn.execute(
                     "UPDATE reports SET status='resolved', decision_admin_id=? WHERE id=? AND status='pending'",
                     (callback.from_user.id, report_id)
-                )
-                conn.commit()
+                ).rowcount
             else:
-                conn.execute(
+                changed = conn.execute(
                     "UPDATE reports SET status='awaiting_rejection_reason', reject_admin_id=? WHERE id=? AND status='pending'",
                     (callback.from_user.id, report_id)
-                )
-                conn.commit()
+                ).rowcount
+            if changed != 1:
+                conn.rollback()
+                await callback.answer("Жалоба уже обработана.", show_alert=True)
+                return
+            conn.commit()
 
         admin_label = "@" + callback.from_user.username if callback.from_user.username else str(callback.from_user.id)
         if action == "report_resolve":
@@ -4884,6 +4889,7 @@ async def report_rejection_reply(message: Message) -> bool:
     if not reason or len(reason) > 1000:
         return False
     with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         report = conn.execute(
             """
             SELECT * FROM reports
@@ -4894,6 +4900,7 @@ async def report_rejection_reply(message: Message) -> bool:
             (message.reply_to_message.message_id, message.from_user.id)
         ).fetchone()
         if not report:
+            conn.rollback()
             return False
         changed = conn.execute(
             """
@@ -4903,9 +4910,10 @@ async def report_rejection_reply(message: Message) -> bool:
             """,
             (message.from_user.id, report["id"])
         ).rowcount
-        conn.commit()
         if changed != 1:
+            conn.rollback()
             return True
+        conn.commit()
 
     try:
         await message.bot.send_message(
