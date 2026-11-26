@@ -3721,6 +3721,12 @@ async def cmd_warn(message: Message):
         ban_now = moscow_now()
         ban_until = ban_now + timedelta(days=7)
         ban_reason = "Достижение максимального количества варнов"
+        target_account_for_ban = get_account(target_id)
+        previous_rank = (
+            target_account_for_ban.get("original_rank")
+            if target_account_for_ban and target_account_for_ban.get("rank") == "rest"
+            else target["rank"]
+        )
 
         # Храним отдельную запись о временном бане, не удаляя профиль и историю варнов.
         with db_connect() as conn:
@@ -3735,20 +3741,20 @@ async def cmd_warn(message: Message):
                 INSERT INTO bans
                     (telegram_id, reason, created_at, expires_at, minecraft_nickname,
                      ban_type, previous_rank, admin_id, unbanned_at)
-                VALUES (?, ?, ?, ?, ?, 'warn', 'legacy', ?, NULL)
+                VALUES (?, ?, ?, ?, ?, 'warn', ?, ?, NULL)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     reason=excluded.reason,
                     created_at=excluded.created_at,
                     expires_at=excluded.expires_at,
                     minecraft_nickname=excluded.minecraft_nickname,
                     ban_type='warn',
-                    previous_rank='legacy',
+                    previous_rank=excluded.previous_rank,
                     admin_id=excluded.admin_id,
                     unbanned_at=NULL
                 """,
                 (
                     target_id, ban_reason, moscow_iso(ban_now),
-                    moscow_iso(ban_until), target["minecraft"], actor_id
+                    moscow_iso(ban_until), target["minecraft"], previous_rank, actor_id
                 )
             )
             conn.execute(
