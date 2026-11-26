@@ -4973,9 +4973,10 @@ async def report_conversation_reply(message: Message, side: str) -> bool:
     if not message.from_user or not message.reply_to_message:
         return False
     with db_connect() as conn:
+        expected_side = "user" if side == "user" else "admin"
         mapping = conn.execute(
-            "SELECT report_id FROM report_conversation_messages WHERE message_id=?",
-            (message.reply_to_message.message_id,)
+            "SELECT report_id FROM report_conversation_messages WHERE message_id=? AND side=?",
+            (message.reply_to_message.message_id, expected_side)
         ).fetchone()
         if not mapping:
             return False
@@ -5131,6 +5132,7 @@ async def report_rejection_reply(message: Message) -> bool:
         "<b>Новый репорт CloverTeam</b>\n\n"
         f"Репорт от игрока: {safe_html('@' + (report['telegram_username'] or '') if report['telegram_username'] else 'не указан')}\n"
         f"Никнейм: <code>{safe_html(report['minecraft_nickname'] or 'не указан')}</code>\n"
+        f"{'<b>Формат: Тикет</b>\n' if report['format'] == 'ticket' else ''}"
         f"Тип: <b>{safe_html(report['report_type'])}</b>\n"
         f"Жалоба:\n{safe_html(report['report_text'])}\n\n"
         f"Отклонен {safe_html(admin_label)}"
