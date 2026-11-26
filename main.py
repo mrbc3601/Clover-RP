@@ -4125,12 +4125,14 @@ async def submit_report(message: Message, session_data: dict):
                 await message.bot.send_photo(
                     ADMIN_CHAT_ID,
                     item["file_id"],
+                    caption=f"Доказательство к жалобе №{report_id}",
                     message_thread_id=REPORT_THREAD_ID or None
                 )
             else:
                 await message.bot.send_video(
                     ADMIN_CHAT_ID,
                     item["file_id"],
+                    caption=f"Доказательство к жалобе №{report_id}",
                     message_thread_id=REPORT_THREAD_ID or None
                 )
         except Exception:
@@ -4203,6 +4205,9 @@ async def report_callback(callback: CallbackQuery):
     data = callback.data or ""
 
     if data.startswith("report_location:") or data.startswith("report_category:") or data.startswith("report_evidence:") or data == "report_media_done":
+        if not callback.message or callback.message.chat.type != "private":
+            await callback.answer("Этот шаг можно выполнить только в личном чате с ботом.", show_alert=True)
+            return
         session = get_report_session(callback.from_user.id)
         if not session:
             await callback.answer("Сессия жалобы не найдена.", show_alert=True)
@@ -4284,6 +4289,9 @@ async def report_callback(callback: CallbackQuery):
         return
 
     if data.startswith("report_resolve:") or data.startswith("report_reject:"):
+        if not callback.message or callback.message.chat.id != ADMIN_CHAT_ID:
+            await callback.answer("Обрабатывать жалобы можно только в админ-чате.", show_alert=True)
+            return
         if get_rest_period(callback.from_user.id):
             await callback.answer("На время реста действие недоступно.", show_alert=True)
             return
