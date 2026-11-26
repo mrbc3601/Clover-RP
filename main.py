@@ -747,6 +747,75 @@ async def warn_expiration_worker():
         await asyncio.sleep(60)
 
 
+async def ban_expiration_worker(bot: Bot):
+    """Автоматически снимает только семидневные баны, выданные за 3 активных варна."""
+    while True:
+        try:
+            now = moscow_iso(moscow_now())
+            with db_connect() as conn:
+                expired = conn.execute(
+                    """
+                    SELECT telegram_id, minecraft_nickname, reason
+                    FROM bans
+                    WHERE ban_type='warn'
+                      AND unbanned_at IS NULL
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= ?
+                    ORDER BY expires_at
+                    LIMIT 50
+                    """,
+                    (now,)
+                ).fetchall()
+
+            for item in expired:
+                telegram_id = int(item["telegram_id"])
+                nickname = item["minecraft_nickname"] or ""
+                try:
+                    if MAIN_CHAT_ID:
+                        await bot.unban_chat_member(
+                            MAIN_CHAT_ID,
+                            telegram_id,
+                            only_if_banned=True
+                        )
+                    if nickname:
+                        await rcon_command(f"pardon {nickname}")
+
+                    with db_connect() as conn:
+                        conn.execute(
+                            "UPDATE bans SET unbanned_at=? WHERE telegram_id=? AND ban_type='warn' AND unbanned_at IS NULL",
+                            (moscow_iso(moscow_now()), telegram_id)
+                        )
+                        conn.execute(
+                            "UPDATE users SET rank='legacy' WHERE telegram_id=? AND rank='warnbanned'",
+                            (telegram_id,)
+                        )
+                        conn.execute(
+                            "UPDATE ban_history SET status='expired' "
+                            "WHERE telegram_id=? AND ban_type='warn' AND status='active' "
+                            "AND expires_at <= ?",
+                            (telegram_id, moscow_iso(moscow_now()))
+                        )
+                        conn.commit()
+
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            "Срок вашей блокировки за три активных варна закончился. "
+                            "Теперь вы можете повторно подать анкету через /start. "
+                            "Для восстановления доступа вступите в основной чат CloverTeam; "
+                            "до повторной регистрации остальные команды будут недоступны."
+                        )
+                    except Exception:
+                        log.warning("Could not notify expired warn-banned user %s", telegram_id, exc_info=True)
+                except Exception:
+                    log.exception("Could not expire warn ban for user %s; retrying", telegram_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Ban expiration worker failed")
+        await asyncio.sleep(60)
+
+
 def get_rest_session(telegram_id: int):
     with db_connect() as conn:
         return conn.execute(
@@ -3614,7 +3683,11 @@ async def cmd_warn(message: Message):
         return
 
     if should_ban:
-        # Гарантируем, что запись пользователя остаётся в users.
+        ban_now = moscow_now()
+        ban_until = ban_now + timedelta(days=7)
+        ban_reason = "Достижение максимального количества варнов"
+
+        # Храним отдельную запись о временном бане, не удаляя профиль и историю варнов.
         with db_connect() as conn:
             conn.execute(
                 "INSERT INTO users(telegram_id, telegram_username, minecraft_nickname, rank) "
@@ -3622,18 +3695,53 @@ async def cmd_warn(message: Message):
                 "ON CONFLICT(telegram_id) DO UPDATE SET rank = 'warnbanned'",
                 (target_id, target["username"], target["minecraft"] or None)
             )
+            conn.execute(
+                """
+                INSERT INTO bans
+                    (telegram_id, reason, created_at, expires_at, minecraft_nickname,
+                     ban_type, previous_rank, admin_id, unbanned_at)
+                VALUES (?, ?, ?, ?, ?, 'warn', 'legacy', ?, NULL)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    reason=excluded.reason,
+                    created_at=excluded.created_at,
+                    expires_at=excluded.expires_at,
+                    minecraft_nickname=excluded.minecraft_nickname,
+                    ban_type='warn',
+                    previous_rank='legacy',
+                    admin_id=excluded.admin_id,
+                    unbanned_at=NULL
+                """,
+                (
+                    target_id, ban_reason, moscow_iso(ban_now),
+                    moscow_iso(ban_until), target["minecraft"], actor_id
+                )
+            )
+            conn.execute(
+                """
+                INSERT INTO ban_history
+                    (telegram_id, admin_id, reason, ban_type, created_at, expires_at, status)
+                VALUES (?, ?, ?, 'warn', ?, ?, 'active')
+                """,
+                (
+                    target_id, actor_id, ban_reason,
+                    moscow_iso(ban_now), moscow_iso(ban_until)
+                )
+            )
+            # Варны остаются в истории, но после наказания больше не считаются активными.
+            conn.execute(
+                "UPDATE warn_history SET status='expired' WHERE telegram_id=? AND status='active'",
+                (target_id,)
+            )
             conn.commit()
 
         server_results = []
         try:
-            await rcon_command(
-                "ban " + target["minecraft"] + " " +
-                "Достижение максимального количества варнов"
-            )
+            await rcon_command(f"ban {target['minecraft']} {ban_reason}")
             server_results.append("бан Minecraft выполнен")
         except Exception:
             log.exception("Minecraft ban via RCON failed for %s", target["minecraft"])
             server_results.append("ошибка Minecraft-бана")
+
         for command in (f"swl remove {target['minecraft']}", "swl reload"):
             try:
                 await rcon_command(command)
@@ -3643,19 +3751,35 @@ async def cmd_warn(message: Message):
                 server_results.append(f"{command}: ошибка")
 
         try:
+            if MAIN_CHAT_ID:
+                await message.bot.ban_chat_member(
+                    MAIN_CHAT_ID,
+                    target_id,
+                    until_date=ban_until.astimezone(timezone.utc)
+                )
+            telegram_result = "Блокировка в основном чате установлена на 7 дней."
+        except Exception:
+            log.exception("Telegram 7-day ban failed for %s", target_id)
+            telegram_result = "Не удалось установить блокировку в Telegram."
+
+        try:
             await message.bot.send_message(
                 target_id,
-                "Вы были забанены в CloverTeam навсегда\n\n"
-                "Причина: Достижение максимального количества варнов"
+                "Вы заблокированы в CloverTeam на 7 дней.\n\n"
+                f"Причина: {safe_html(ban_reason)}\n"
+                f"Окончание: {safe_html(moscow_iso(ban_until))}\n\n"
+                "После окончания срока вы сможете повторно подать анкету. "
+                "Для восстановления доступа необходимо снова вступить в основной чат."
             )
             dm_result = "Личное уведомление отправлено."
         except Exception:
             dm_result = "Не удалось отправить ЛС (пользователь мог не открыть диалог с ботом)."
 
         await message.reply(
-            "⛔ Достигнут лимит варнов: пользователь заблокирован.\n"
+            "⛔ Достигнут лимит варнов: пользователь заблокирован на 7 дней.\n"
             f"Игрок: <code>{safe_html(target['minecraft'])}</code>\n"
-            f"Активных варнов: <b>{count}</b>\n"
+            f"Активных варнов перед блокировкой: <b>{count}</b>\n"
+            f"{safe_html(telegram_result)}\n"
             f"{safe_html(dm_result)}\n"
             f"RCON: {safe_html('; '.join(server_results))}"
         )
