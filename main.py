@@ -3952,7 +3952,7 @@ async def cmd_ban(message: Message):
     if not target:
         await message.reply("Игрок не найден в базе users.")
         return
-    if not reason or len(reason) > 350 or any(c in reason for c in "\\r\\n\\x00"):
+    if not reason or len(reason) > 350 or any(c in reason for c in "\r\n\x00"):
         await message.reply("Причина должна быть одной строкой длиной до 350 символов.")
         return
     if target["telegram_id"] == message.from_user.id:
@@ -6492,6 +6492,10 @@ async def main():
         whitelist_worker()
     )
 
+    ban_expiration_task = asyncio.create_task(
+        ban_expiration_worker(bot)
+    )
+
     log.info("CloverTeam bot started")
 
     try:
@@ -6505,8 +6509,9 @@ async def main():
         clan_expiration_task.cancel()
         warn_expiration_task.cancel()
         whitelist_task.cancel()
+        ban_expiration_task.cancel()
 
-        for task in (expiration_task, clan_expiration_task, warn_expiration_task, whitelist_task):
+        for task in (expiration_task, clan_expiration_task, warn_expiration_task, whitelist_task, ban_expiration_task):
             try:
                 await task
             except asyncio.CancelledError:
