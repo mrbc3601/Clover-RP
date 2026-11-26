@@ -387,6 +387,33 @@ def init_db():
             )
         """)
 
+        ban_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(bans)").fetchall()
+        }
+        for column, definition in {
+            "expires_at": "TEXT",
+            "minecraft_nickname": "TEXT",
+            "ban_type": "TEXT NOT NULL DEFAULT 'manual'",
+            "previous_rank": "TEXT",
+            "admin_id": "INTEGER",
+            "unbanned_at": "TEXT"
+        }.items():
+            if column not in ban_columns:
+                conn.execute(f"ALTER TABLE bans ADD COLUMN {column} {definition}")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ban_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                admin_id INTEGER,
+                reason TEXT NOT NULL,
+                ban_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                status TEXT NOT NULL DEFAULT 'active'
+            )
+        """)
+
         # Постоянная блокировка подачи анкет по Telegram ID.
         # Отдельная таблица гарантирует, что /unreg не снимет этот запрет.
         conn.execute("""
@@ -604,21 +631,40 @@ def is_senior_admin(telegram_id: int) -> bool:
 
 
 def is_banned(telegram_id: int) -> bool:
-    """Общая проверка блокировок, включая запрет подачи анкет."""
+    """Проверяет активную блокировку и постоянный запрет подачи анкет."""
+    now = moscow_iso(moscow_now())
     with db_connect() as conn:
         result = conn.execute(
             """
-            SELECT 1 FROM bans WHERE telegram_id = ?
+            SELECT 1 FROM bans
+            WHERE telegram_id = ?
+              AND unbanned_at IS NULL
+              AND (expires_at IS NULL OR expires_at > ?)
             UNION ALL
             SELECT 1 FROM ank_bans WHERE telegram_id = ?
-            UNION ALL
-            SELECT 1 FROM users WHERE telegram_id = ? AND rank = 'warnbanned'
             LIMIT 1
             """,
-            (telegram_id, telegram_id, telegram_id)
+            (telegram_id, now, telegram_id)
         ).fetchone()
-
     return result is not None
+
+
+def is_expired_warn_ban(telegram_id: int) -> bool:
+    now = moscow_iso(moscow_now())
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM bans
+            WHERE telegram_id = ?
+              AND ban_type = 'warn'
+              AND expires_at IS NOT NULL
+              AND expires_at <= ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (telegram_id, now)
+        ).fetchone()
+    return row is not None
 
 
 WARN_RANK_LEVEL = {
@@ -891,7 +937,10 @@ class LegacyAccessMiddleware(BaseMiddleware):
                 command_token = text.split(maxsplit=1)[0]
                 command_name = command_token.split("@", 1)[0].lstrip("/").lower()
 
-                if command_name != "reg":
+                allowed_legacy_commands = {"reg"}
+                if is_expired_warn_ban(user.id):
+                    allowed_legacy_commands.add("start")
+                if command_name not in allowed_legacy_commands:
                     await event.reply(
                         "Ваш статус — <b>legacy</b>.\n\n"
                         "Для активации аккаунта доступна только команда:\n"
@@ -1095,7 +1144,8 @@ async def cmd_start(message: Message):
         )
         return
 
-    if get_user(telegram_id):
+    existing_user = get_user(telegram_id)
+    if existing_user and not is_expired_warn_ban(telegram_id):
         await message.reply(
             "Вы уже зарегистрированы на данный момент."
         )
@@ -1579,9 +1629,10 @@ async def cmd_reg(message: Message):
         return
 
     existing = get_user(telegram_id)
-    legacy = bool(existing and existing["rank"] == "legacy")
+    expired_warn_ban = is_expired_warn_ban(telegram_id)
+    legacy = bool(existing and existing["rank"] == "legacy" and not expired_warn_ban)
 
-    if existing and not legacy:
+    if existing and not legacy and not expired_warn_ban:
         await message.reply(
             "Вы уже зарегистрированы на данный момент."
         )
@@ -1622,7 +1673,7 @@ async def cmd_reg(message: Message):
     try:
         with db_connect() as conn:
 
-            if legacy:
+            if legacy or expired_warn_ban:
                 cursor = conn.execute(
                     """
                     UPDATE users
@@ -1630,7 +1681,7 @@ async def cmd_reg(message: Message):
                         minecraft_nickname = ?,
                         rank = 'player'
                     WHERE telegram_id = ?
-                    AND rank = 'legacy'
+                    AND rank IN ('legacy', 'warnbanned')
                     """,
                     (
                         username,
