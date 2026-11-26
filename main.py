@@ -4386,11 +4386,11 @@ async def report_rejection_reply(message: Message) -> bool:
 
     admin_label = "@" + message.from_user.username if message.from_user.username else str(message.from_user.id)
     updated_text = (
-        "<b>Новый репорт CloverTeam</b>\\n\\n"
-        f"Репорт от игрока: {safe_html('@' + (report['telegram_username'] or '') if report['telegram_username'] else 'не указан')}\\n"
-        f"Никнейм: <code>{safe_html(report['minecraft_nickname'] or 'не указан')}</code>\\n"
-        f"Тип: <b>{safe_html(report['report_type'])}</b>\\n"
-        f"Жалоба:\\n{safe_html(report['report_text'])}\\n\\n"
+        "<b>Новый репорт CloverTeam</b>\n\n"
+        f"Репорт от игрока: {safe_html('@' + (report['telegram_username'] or '') if report['telegram_username'] else 'не указан')}\n"
+        f"Никнейм: <code>{safe_html(report['minecraft_nickname'] or 'не указан')}</code>\n"
+        f"Тип: <b>{safe_html(report['report_type'])}</b>\n"
+        f"Жалоба:\n{safe_html(report['report_text'])}\n\n"
         f"Отклонен {safe_html(admin_label)}"
     )
     try:
